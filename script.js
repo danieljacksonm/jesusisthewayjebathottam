@@ -1,83 +1,133 @@
+const joinBtn = document.getElementById('joinBtn');
+const roomInput = document.getElementById('roomInput');
+const peerIdInput = document.getElementById('peerIdInput');
+const localAudio = document.getElementById('localAudio');
+const remoteAudios = document.getElementById('remoteAudios');
+
 let localStream;
-let peers = {};
-let roomName = '';
+let peers = {}; // peerId -> RTCPeerConnection
+let room;
+let peerId;
+let pollingInterval;
 
-const videoContainer = document.getElementById('videos');
+const signalingUrl = 'signaling.php';
 
-async function joinRoom() {
-  roomName = document.getElementById('roomInput').value.trim();
-  if (!roomName) return alert('Enter a room name');
+// STUN servers config for NAT traversal
+const rtcConfig = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+};
 
-  // Get local media
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  const localVideo = document.createElement('video');
-  localVideo.srcObject = localStream;
-  localVideo.autoplay = true;
-  localVideo.muted = true;
-  videoContainer.appendChild(localVideo);
+joinBtn.onclick = async () => {
+  room = roomInput.value.trim();
+  peerId = peerIdInput.value.trim();
 
-  // Start polling signaling server every 2 seconds
-  setInterval(fetchSignals, 2000);
-}
+  if (!room || !peerId) {
+    alert('Please enter room and unique peer ID');
+    return;
+  }
 
-async function fetchSignals() {
-  const response = await fetch('signaling.php?room=' + roomName);
-  const messages = await response.json();
+  joinBtn.disabled = true;
+  roomInput.disabled = true;
+  peerIdInput.disabled = true;
 
-  for (const msg of messages) {
-    const { from, data } = msg;
+  await startLocalAudio();
+  startSignalingLoop();
+};
 
-    if (!peers[from]) {
-      createPeer(from, false);
-    }
-
-    const pc = peers[from];
-    if (data.type === 'offer') {
-      await pc.setRemoteDescription(new RTCSessionDescription(data));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      sendSignal(from, answer);
-    } else if (data.type === 'answer') {
-      await pc.setRemoteDescription(new RTCSessionDescription(data));
-    } else if (data.candidate) {
-      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-    }
+async function startLocalAudio() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    localAudio.srcObject = localStream;
+  } catch (e) {
+    alert('Could not get audio: ' + e.message);
   }
 }
 
-function sendSignal(to, data) {
-  fetch('signaling.php', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room: roomName, to, data })
-  });
+async function startSignalingLoop() {
+  await sendSignalingData(null); // send empty data on join
+
+  pollingInterval = setInterval(async () => {
+    await pollSignalingData();
+  }, 2000);
 }
 
-function createPeer(id, initiator = true) {
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-  });
+async function sendSignalingData(data) {
+  return fetch(`${signalingUrl}?room=${encodeURIComponent(room)}&peer=${encodeURIComponent(peerId)}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data || {})
+  }).then(res => res.json());
+}
 
-  pc.onicecandidate = e => {
-    if (e.candidate) {
-      sendSignal(id, { candidate: e.candidate });
+async function pollSignalingData() {
+  try {
+    const res = await fetch(`${signalingUrl}?room=${encodeURIComponent(room)}&peer=${encodeURIComponent(peerId)}`);
+    const data = await res.json();
+
+    // For each remote peer signaling data
+    for (const otherPeerId in data) {
+      if (!peers[otherPeerId]) {
+        createPeerConnection(otherPeerId, true);
+      }
+
+      const msg = data[otherPeerId];
+
+      if (msg.sdp) {
+        const desc = new RTCSessionDescription(msg.sdp);
+        await peers[otherPeerId].setRemoteDescription(desc);
+
+        if (desc.type === 'offer') {
+          const answer = await peers[otherPeerId].createAnswer();
+          await peers[otherPeerId].setLocalDescription(answer);
+          await sendSignalingData({ sdp: peers[otherPeerId].localDescription });
+        }
+      }
+
+      if (msg.candidate) {
+        try {
+          await peers[otherPeerId].addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch (e) {
+          console.warn('Error adding ICE candidate:', e);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Polling signaling error:', e);
+  }
+}
+
+function createPeerConnection(otherPeerId, isOfferer) {
+  const pc = new RTCPeerConnection(rtcConfig);
+
+  pc.onicecandidate = async event => {
+    if (event.candidate) {
+      await sendSignalingData({ candidate: event.candidate });
     }
   };
 
-  pc.ontrack = e => {
-    const remoteVideo = document.createElement('video');
-    remoteVideo.srcObject = e.streams[0];
-    remoteVideo.autoplay = true;
-    videoContainer.appendChild(remoteVideo);
+  pc.ontrack = event => {
+    let remoteAudio = document.getElementById('remoteAudio-' + otherPeerId);
+    if (!remoteAudio) {
+      remoteAudio = document.createElement('audio');
+      remoteAudio.id = 'remoteAudio-' + otherPeerId;
+      remoteAudio.autoplay = true;
+      remoteAudio.controls = true;
+      remoteAudios.appendChild(remoteAudio);
+    }
+    remoteAudio.srcObject = event.streams[0];
   };
 
   localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  peers[id] = pc;
 
-  if (initiator) {
+  peers[otherPeerId] = pc;
+
+  if (isOfferer) {
     pc.createOffer().then(offer => {
-      pc.setLocalDescription(offer);
-      sendSignal(id, offer);
+      pc.setLocalDescription(offer).then(() => {
+        sendSignalingData({ sdp: pc.localDescription });
+      });
     });
   }
+
+  return pc;
 }

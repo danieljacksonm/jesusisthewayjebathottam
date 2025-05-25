@@ -2,8 +2,8 @@
 header('Content-Type: application/json');
 
 $room = $_GET['room'] ?? null;
-$peer = $_GET['peer'] ?? null; // identify the sender
-$action = $_SERVER['REQUEST_METHOD']; // GET or POST
+$peer = $_GET['peer'] ?? null;
+$method = $_SERVER['REQUEST_METHOD'];
 
 if (!$room || !$peer) {
     http_response_code(400);
@@ -18,34 +18,31 @@ if (!file_exists($dataDir)) {
 
 $filePath = "$dataDir/signaling.json";
 
-// Handle POST: save signaling data from this peer
-if ($action === 'POST') {
+if ($method === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         http_response_code(400);
         echo json_encode(['error' => 'Invalid JSON']);
         exit;
     }
-    
+
     $allData = [];
     if (file_exists($filePath)) {
         $allData = json_decode(file_get_contents($filePath), true) ?? [];
     }
-    
-    // Save this peer's data
+
     $allData[$peer] = $input;
     file_put_contents($filePath, json_encode($allData));
     echo json_encode(['success' => true]);
     exit;
 }
 
-// Handle GET: send all signaling data except the requesting peer's own data
-if ($action === 'GET') {
+if ($method === 'GET') {
     $allData = [];
     if (file_exists($filePath)) {
         $allData = json_decode(file_get_contents($filePath), true) ?? [];
     }
-    unset($allData[$peer]); // do not send back own data
+    unset($allData[$peer]); // do not send own data back
     echo json_encode($allData);
     exit;
 }
